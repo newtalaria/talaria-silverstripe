@@ -1,0 +1,19 @@
+---
+Name: talaria-tracing
+After:
+  - '#talaria-logging'
+  # Framework maps MySQLDatabase → SilverStripe\ORM\Connect\MySQLDatabase.
+  # Without this After, that fragment wins and query spans never wrap.
+  - '#databaseconnectors'
+---
+SilverStripe\Core\Injector\Injector:
+  Talaria\SilverStripe\HttpMiddleware:
+    class: Talaria\SilverStripe\HttpMiddleware
+  SilverStripe\Control\Director:
+    properties:
+      Middlewares:
+        TalariaTracing: '%$Talaria\SilverStripe\HttpMiddleware'
+  MySQLDatabase:
+    class: Talaria\SilverStripe\TracingMySQLDatabase
+  GuzzleHttp\Client:
+    factory: Talaria\SilverStripe\GuzzleClientFactory

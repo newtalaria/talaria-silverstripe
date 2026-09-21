@@ -1,0 +1,62 @@
+---
+Name: talaria-logging
+After:
+  - '#corelogging'
+---
+SilverStripe\Core\Injector\Injector:
+  Talaria\TalariaClient:
+    factory: Talaria\SilverStripe\InjectorFactory
+  # Deprecated alias — prefer Talaria\TalariaClient
+  Talaria\Client:
+    factory: Talaria\SilverStripe\InjectorFactory
+  # Neutral service id — never name this after a concrete handler class.
+  # Factory require_once's TalariaLogHandlerMonolog3 or …MonologLegacy only.
+  talariaLogHandler:
+    factory: Talaria\SilverStripe\LogHandlerFactory
+  Psr\Log\LoggerInterface:
+    calls:
+      PushTalariaHandler: [ pushHandler, [ '%$talariaLogHandler' ] ]
+
+Talaria\SilverStripe\Config:
+  dsn: '`TALARIA_DSN`'
+  # Optional: browser inject only (falls back to dsn). Use when PHP DSN is not
+  # reachable from the browser (e.g. http://host.docker.internal behind HTTPS).
+  browserDsn: '`TALARIA_BROWSER_DSN`'
+  apiKey: '`TALARIA_API_KEY`'
+  environment: '`TALARIA_ENVIRONMENT`'
+  release: '`TALARIA_RELEASE`'
+  minLevel: warning
+  # When true, scoped Talaria\Logger cannot go below minLevel (legacy hard floor).
+  # Default false — named/scoped overrides may be more verbose than the default.
+  enforceDefaultLevel: false
+  maxBatchSize: 50
+  flushIntervalMs: 2000
+  sampleRate: 1.0
+  enableTracing: false
+  # tracesSampleRate: 0.1
+  # Optional PHP ignore lists (substring or /regex/flags).
+  # ignoreErrors:
+  #   - 'Ignore this message'
+  # ignoreUrls:
+  #   - '/vendor/'
+  # Optional extra browser ignore lists (SDK already ships known-noise defaults).
+  # browserIgnoreErrors:
+  #   - 'Custom widget noise'
+  # browserIgnoreUrls:
+  #   - 'googletagmanager.com'
+  enableBrowserCms: true
+  enableBrowserFrontend: true
+  browserSdkVersion: '0.1.25'
+  # Optional named logger presets for Approach B (Talaria::logger('name'))
+  # loggers:
+  #   businessDirectory:
+  #     minLevel: info
+  #     tags:
+  #       area: businessDirectory
+  # Optional filterable app name (reserved tag key `service`)
+  # service: 'my-site'
+  # Optional PHP + browser init tags (string→string, low cardinality)
+  # tags:
+  #   team: 'platform'
+  # browserTags:
+  #   area: 'marketing'
