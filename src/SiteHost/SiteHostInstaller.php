@@ -7,8 +7,8 @@ namespace Talaria\SilverStripe\SiteHost;
 use Talaria\Monitor\MonitorCheckIn;
 
 /**
- * Reconciles SiteHost crontab check-ins, the supervisord probe, and the
- * log collector. Cron still pings with curl.
+ * Reconciles SiteHost crontab check-ins and the supervisord probe.
+ * Cron sends check-ins with curl. The deploy action owns the log collector.
  */
 final class SiteHostInstaller
 {
@@ -20,26 +20,16 @@ final class SiteHostInstaller
 
     public const PROBE_END = '# end-talaria-sitehost-probe';
 
-    public const COLLECTOR_BEGIN = '# talaria-otelcol';
-
-    public const COLLECTOR_END = '# end-talaria-otelcol';
-
-    public const COLLECTOR_VERSION = '0.162.0';
-
-    public const COLLECTOR_SHA256 = 'fcc063749f730f8c21fe29f2d340ff174f5f1c5885bd3156fb6c985a3036fcc3';
-
     public function __construct(
         private readonly string $appPath,
         private readonly string $specPath,
         private readonly string $cronPath,
         private readonly string $supervisorPath,
         private readonly string $tokenPath,
-        private readonly string $dsn,
+        private readonly string $url,
         private readonly string $apiKey,
         private readonly CheckInTransport $transport,
         private readonly bool $probeOnly = false,
-        private readonly bool $installCollector = false,
-        private readonly string $collectorConfigPath = '/container/config/talaria-otelcol.yaml',
     ) {
     }
 
@@ -71,17 +61,26 @@ final class SiteHostInstaller
             throw new SiteHostInstallException('SITEHOST_APP_PATH is required');
         }
 
+        $apiKey = trim((string) (getenv('TALARIA_API_KEY') ?: ''));
+        $url = trim((string) (getenv('TALARIA_URL') ?: ''));
+        if ($url === '' && $apiKey !== '') {
+            try {
+                $url = \Talaria\Credential::parseApiKey($apiKey)->ingestUrl();
+            } catch (\InvalidArgumentException $exception) {
+                throw new SiteHostInstallException($exception->getMessage());
+            }
+        }
+
         return new self(
             $app,
             $app . '/talaria/sitehost/monitors.json',
             (string) (getenv('SITEHOST_CRONTAB') ?: '/container/crontabs/crontab'),
             (string) (getenv('SITEHOST_SUPERVISORD') ?: '/container/config/supervisord.conf'),
             $app . '/.talaria-monitor-tokens',
-            trim((string) (getenv('TALARIA_DSN') ?: getenv('TALARIA_BASE_URL') ?: '')),
-            trim((string) (getenv('TALARIA_API_KEY') ?: '')),
+            $url,
+            $apiKey,
             $transport ?? new PhpStreamCheckInTransport(),
             getenv('TALARIA_INSTALL_PROBE') === 'true',
-            true,
         );
     }
 
@@ -107,7 +106,7 @@ final class SiteHostInstaller
         }
 
         if ($jobs !== []) {
-            $base = self::baseUrl($this->dsn);
+            $baseUrl = rtrim($this->url, '/');
             self::assertApiKey($this->apiKey);
             $tokens = $this->readTokens();
             foreach ($jobs as $job) {
@@ -115,11 +114,11 @@ final class SiteHostInstaller
                 if (($tokens[$slug] ?? '') !== '') {
                     continue;
                 }
-                $tokens[$slug] = $this->register($job, $base);
+                $tokens[$slug] = $this->register($job, $baseUrl);
                 $this->writeTokens($this->tokensForJobs($jobs, $tokens));
             }
             $existing = is_file($this->cronPath) ? (string) file_get_contents($this->cronPath) : '';
-            $cron = self::reconcileCrontab($existing, $jobs, $base, $tokens);
+            $cron = self::reconcileCrontab($existing, $jobs, $baseUrl, $tokens);
             $this->atomicWrite($this->cronPath, $cron, 0644);
         }
 
@@ -127,25 +126,7 @@ final class SiteHostInstaller
             (string) file_get_contents($this->supervisorPath),
             $this->appPath,
         );
-        if ($this->installCollector) {
-            $this->ensureCollectorBinary();
-            $config = self::collectorConfig(
-                self::baseUrl($this->dsn) . '/otlp',
-                self::collectorResource('TALARIA_SERVICE_NAME', 'silverstripe'),
-                self::collectorResource('TALARIA_CONTAINER_NAME', (string) (gethostname() ?: 'container')),
-                self::collectorResource('TALARIA_ENVIRONMENT', 'production'),
-            );
-            $this->atomicWrite($this->collectorConfigPath, $config, 0644);
-            $supervisor = self::reconcileCollector(
-                $supervisor,
-                $this->appPath,
-                $this->collectorConfigPath,
-            );
-        }
         $this->atomicWrite($this->supervisorPath, $supervisor, 0644);
-        if ($this->installCollector) {
-            $this->reloadSupervisor();
-        }
     }
 
     /**
@@ -206,15 +187,15 @@ final class SiteHostInstaller
      */
     public static function reconcileCrontab(string $existing, array $jobs, string $baseUrl, array $tokens): string
     {
-        $baseUrl = self::baseUrl($baseUrl);
+        $baseUrl = rtrim($baseUrl, '/');
         $lines = self::splitLines($existing);
         $lines = self::stripManagedCron($lines);
         $lines = self::retireLegacy($lines, $jobs);
         $block = [self::CRON_BEGIN];
         foreach ($jobs as $job) {
             $token = $tokens[$job['slug']] ?? '';
-            if (preg_match('/^tal_ping_[A-Za-z0-9]+$/', $token) !== 1) {
-                throw new SiteHostInstallException('No ping token for ' . $job['slug']);
+            if (!\Talaria\Credential::isMonitorToken($token)) {
+                throw new SiteHostInstallException('No monitor token for ' . $job['slug']);
             }
             $block[] = self::crontabLine($job['crontab'], $job['command'], $token, $baseUrl, $job['slug']);
         }
@@ -274,148 +255,6 @@ final class SiteHostInstaller
         return implode("\n", $all) . "\n";
     }
 
-    public static function reconcileCollector(string $existing, string $appPath, string $configPath): string
-    {
-        $appPath = self::supervisordPath($appPath, 'Application path');
-        $configPath = self::supervisordPath($configPath, 'Collector config path');
-        $binary = $appPath . '/.talaria/otelcol-contrib';
-        $lines = self::splitLines($existing);
-        $kept = [];
-        $count = count($lines);
-        for ($i = 0; $i < $count; $i++) {
-            if (trim($lines[$i]) !== self::COLLECTOR_BEGIN) {
-                $kept[] = $lines[$i];
-                continue;
-            }
-            $end = null;
-            for ($j = $i + 1; $j < $count && $j - $i <= 40; $j++) {
-                if (trim($lines[$j]) === self::COLLECTOR_END) {
-                    $end = $j;
-                    break;
-                }
-            }
-            if ($end === null) {
-                throw new SiteHostInstallException(
-                    'supervisord collector block is missing # end-talaria-otelcol',
-                );
-            }
-            $i = $end;
-        }
-        while ($kept !== [] && trim((string) end($kept)) === '') {
-            array_pop($kept);
-        }
-        $block = [
-            self::COLLECTOR_BEGIN,
-            '[program:talaria-otelcol]',
-            'command=' . $binary . ' --config=' . $configPath,
-            'directory=' . $appPath,
-            'autostart=true',
-            'autorestart=true',
-            'stdout_logfile=/container/logs/talaria-otelcol.log',
-            'stderr_logfile=/container/logs/talaria-otelcol.err',
-            self::COLLECTOR_END,
-        ];
-        $all = $kept === [] ? $block : array_merge($kept, [''], $block);
-
-        return implode("\n", $all) . "\n";
-    }
-
-    public static function collectorConfig(
-        string $endpoint,
-        string $service,
-        string $container,
-        string $environment,
-    ): string {
-        if (preg_match('#^https?://[^\'\s]+/otlp$#', $endpoint) !== 1) {
-            throw new SiteHostInstallException('Collector endpoint must end in /otlp');
-        }
-        $service = self::collectorAttribute($service, 'service.name');
-        $container = self::collectorAttribute($container, 'container.name');
-        $environment = self::collectorAttribute($environment, 'deployment.environment.name');
-        $template = <<<'YAML'
-receivers:
-  filelog:
-    include:
-      - /container/logs/apache2/error.log
-      - /container/logs/php-fpm/*.log
-      - /container/logs/cron-*.log
-      - /container/logs/sitehost/sitehost.log
-    exclude:
-      - /container/logs/**/*.gz
-      - /container/logs/apache2/access.log
-      - /container/logs/apache2/other_vhosts_access.log
-      - /container/logs/rsyslog/*
-      - /container/logs/supervisor/*
-      - /container/logs/talaria-otelcol.log
-      - /container/logs/talaria-otelcol.err
-      - /container/logs/talaria-sitehost-probe.log
-      - /container/logs/talaria-sitehost-probe.err
-    start_at: end
-    operators:
-      - type: regex_parser
-        parse_from: body
-        regex: '\[(?:[^\]]*:)?(?P<level>notice|info|warn|warning|error|crit|alert|emerg|critical|debug)\]'
-        on_error: send_quiet
-      - type: regex_parser
-        parse_from: body
-        regex: '(?i)(?:^|\s)(?P<level>NOTICE|INFO|WARNING|WARN|ERROR|CRITICAL|CRIT|ALERT|EMERG|DEBUG)\s*:'
-        on_error: send_quiet
-      - type: severity_parser
-        parse_from: attributes.level
-        on_error: send_quiet
-        mapping:
-          info:
-            - notice
-            - info
-          warn:
-            - warn
-            - warning
-          error:
-            - error
-          fatal:
-            - crit
-            - alert
-            - emerg
-            - critical
-processors:
-  memory_limiter:
-    check_interval: 1s
-    limit_mib: 128
-    spike_limit_mib: 25
-  resource:
-    attributes:
-      - key: service.name
-        value: "___SERVICE___"
-        action: upsert
-      - key: container.name
-        value: "___CONTAINER___"
-        action: upsert
-      - key: deployment.environment.name
-        value: "___ENVIRONMENT___"
-        action: upsert
-  batch: {}
-exporters:
-  otlphttp:
-    endpoint: "___ENDPOINT___"
-    headers:
-      X-API-Key: ${env:TALARIA_API_KEY}
-    compression: gzip
-service:
-  pipelines:
-    logs:
-      receivers: [filelog]
-      processors: [memory_limiter, resource, batch]
-      exporters: [otlphttp]
-YAML;
-
-        return strtr($template, [
-            '___ENDPOINT___' => $endpoint,
-            '___SERVICE___' => $service,
-            '___CONTAINER___' => $container,
-            '___ENVIRONMENT___' => $environment,
-        ]) . "\n";
-    }
-
     /**
      * @param array{slug: string, crontab: string, timezone: string, command: string, marginSeconds: ?int, maxRuntimeSeconds: ?int} $job
      */
@@ -431,13 +270,14 @@ YAML;
         if ($job['maxRuntimeSeconds'] !== null) {
             $schedule['maxRuntimeSeconds'] = $job['maxRuntimeSeconds'];
         }
-        $json = json_encode(MonitorCheckIn::payload($job['slug'], 'ok', $schedule));
+        $slug = $job['slug'];
+        $json = json_encode(MonitorCheckIn::payload($slug, 'ok', $schedule));
         if (!is_string($json)) {
-            throw new SiteHostInstallException('Could not encode the check-in for ' . $job['slug']);
+            throw new SiteHostInstallException('Could not encode the check-in for ' . $slug);
         }
-        $result = $this->transport->post($base . '/monitors/checkIn', $this->apiKey, $json);
-        $token = self::pingTokenFrom($result['body']);
-        if (preg_match('/^tal_ping_[A-Za-z0-9]+$/', $token) !== 1) {
+        $result = $this->transport->post($base . '/v1/monitors/' . rawurlencode($slug) . '/check-ins', $this->apiKey, $json);
+        $token = self::monitorTokenFrom($result['body']);
+        if (!\Talaria\Credential::isMonitorToken($token)) {
             throw new SiteHostInstallException(
                 'Check-in for ' . $job['slug'] . ' failed: HTTP ' . $result['code'] . ' ' . self::errorDetail($result['body']),
             );
@@ -497,19 +337,14 @@ YAML;
 
     private static function assertApiKey(string $apiKey): void
     {
-        if ($apiKey === '') {
-            throw new SiteHostInstallException('Set TALARIA_DSN and TALARIA_API_KEY to register check-ins');
+        try {
+            $credential = \Talaria\Credential::parseApiKey($apiKey);
+        } catch (\InvalidArgumentException) {
+            throw new SiteHostInstallException('Set TALARIA_URL and a tal_sk_ TALARIA_API_KEY to register check-ins');
         }
-    }
-
-    private static function baseUrl(string $dsn): string
-    {
-        $base = rtrim(trim($dsn), '/');
-        if (preg_match('#^https?://[^\'\s]+$#', $base) !== 1) {
-            throw new SiteHostInstallException('Set TALARIA_DSN and TALARIA_API_KEY to register check-ins');
+        if (!$credential->isSecret()) {
+            throw new SiteHostInstallException('Registering check-ins requires a tal_sk_ key with monitors:write');
         }
-
-        return $base;
     }
 
     /**
@@ -601,16 +436,16 @@ YAML;
         string $url,
         string $slug,
     ): string {
-        $ping = $url . '/monitors/ping';
-        $curl = "curl -fsS -m 15 -X POST -H 'X-Monitor-Token: {$token}' -H 'Content-Type: application/json'";
+        $checkInUrl = $url . '/v1/check-ins';
+        $curl = "curl -fsS -m 15 -X POST -H 'Authorization: Bearer {$token}' -H 'Content-Type: application/json'";
 
-        return $schedule . ' ' . $curl . " -d '{\"status\":\"in_progress\"}' '{$ping}'; "
+        return $schedule . ' ' . $curl . " -d '{\"status\":\"in_progress\"}' '{$checkInUrl}'; "
             . $command . '; talaria_status=$?; if [ "$talaria_status" -eq 0 ]; then '
-            . $curl . " -d '{\"status\":\"ok\"}' '{$ping}'; else "
-            . $curl . " -d '{\"status\":\"error\"}' '{$ping}'; fi; exit \"\$talaria_status\" # talaria-monitor:{$slug}";
+            . $curl . " -d '{\"status\":\"ok\"}' '{$checkInUrl}'; else "
+            . $curl . " -d '{\"status\":\"error\"}' '{$checkInUrl}'; fi; exit \"\$talaria_status\" # talaria-monitor:{$slug}";
     }
 
-    private static function pingTokenFrom(string $body): string
+    private static function monitorTokenFrom(string $body): string
     {
         try {
             $data = json_decode($body, true, 32, JSON_THROW_ON_ERROR);
@@ -620,12 +455,12 @@ YAML;
         if (!is_array($data)) {
             return '';
         }
-        if (is_string($data['pingToken'] ?? null) && $data['pingToken'] !== '') {
-            return $data['pingToken'];
+        if (is_string($data['monitorToken'] ?? null) && $data['monitorToken'] !== '') {
+            return $data['monitorToken'];
         }
         $result = $data['result'] ?? null;
-        if (is_array($result) && is_string($result['pingToken'] ?? null)) {
-            return $result['pingToken'];
+        if (is_array($result) && is_string($result['monitorToken'] ?? null)) {
+            return $result['monitorToken'];
         }
 
         return '';
@@ -645,6 +480,12 @@ YAML;
         $message = '';
         if (is_array($inner) && is_string($inner['message'] ?? null)) {
             $message = $inner['message'];
+        }
+        if ($message === '' && is_string($data['detail'] ?? null)) {
+            $message = $data['detail'];
+        }
+        if ($message === '' && is_string($data['code'] ?? null)) {
+            $message = $data['code'];
         }
         if ($message === '' && is_string($data['message'] ?? null)) {
             $message = $data['message'];
@@ -673,10 +514,17 @@ YAML;
             if (trim($line) === '') {
                 continue;
             }
-            if (preg_match('/^([A-Za-z0-9][A-Za-z0-9_-]{0,80})=(tal_ping_[A-Za-z0-9]+)$/', trim($line), $match) !== 1) {
-                throw new SiteHostInstallException('The ping token file has a line that is not slug=token');
+            $line = trim($line);
+            $eq = strpos($line, '=');
+            if ($eq === false || $eq === 0) {
+                throw new SiteHostInstallException('The monitor token file has a line that is not slug=token');
             }
-            $tokens[$match[1]] = $match[2];
+            $slug = substr($line, 0, $eq);
+            $token = substr($line, $eq + 1);
+            if (preg_match('/^[A-Za-z0-9][A-Za-z0-9_-]{0,80}$/', $slug) !== 1 || !\Talaria\Credential::isMonitorToken($token)) {
+                throw new SiteHostInstallException('The monitor token file has a line that is not slug=token');
+            }
+            $tokens[$slug] = $token;
         }
 
         return $tokens;
@@ -711,111 +559,6 @@ YAML;
         }
         $body = $lines === [] ? '' : implode("\n", $lines) . "\n";
         $this->atomicWrite($this->tokenPath, $body, 0600);
-    }
-
-    private function ensureCollectorBinary(): void
-    {
-        $dir = $this->appPath . '/.talaria';
-        if (!is_dir($dir) && !mkdir($dir, 0755, true) && !is_dir($dir)) {
-            throw new SiteHostInstallException('Could not create ' . $dir);
-        }
-        $binary = $dir . '/otelcol-contrib';
-        $stamp = $dir . '/otelcol-contrib.version';
-        if (
-            is_executable($binary)
-            && is_file($stamp)
-            && trim((string) file_get_contents($stamp)) === self::COLLECTOR_VERSION
-        ) {
-            return;
-        }
-        if (PHP_OS_FAMILY !== 'Linux' || php_uname('m') !== 'x86_64') {
-            throw new SiteHostInstallException(
-                'otelcol-contrib ' . self::COLLECTOR_VERSION . ' is published for linux amd64',
-            );
-        }
-        $tar = $dir . '/otelcol-contrib.tar.gz';
-        $url = 'https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v'
-            . self::COLLECTOR_VERSION
-            . '/otelcol-contrib_' . self::COLLECTOR_VERSION . '_linux_amd64.tar.gz';
-        $output = [];
-        $code = 0;
-        exec(
-            'curl -fsSL --retry 2 --max-time 180 -o ' . escapeshellarg($tar) . ' ' . escapeshellarg($url) . ' 2>&1',
-            $output,
-            $code,
-        );
-        if ($code !== 0 || !is_file($tar)) {
-            @unlink($tar);
-            throw new SiteHostInstallException('Could not download otelcol-contrib ' . self::COLLECTOR_VERSION);
-        }
-        $hash = hash_file('sha256', $tar);
-        if ($hash !== self::COLLECTOR_SHA256) {
-            @unlink($tar);
-            throw new SiteHostInstallException('otelcol-contrib checksum did not match');
-        }
-        $extracted = [];
-        $extractCode = 0;
-        exec(
-            'tar -xzf ' . escapeshellarg($tar) . ' -C ' . escapeshellarg($dir) . ' otelcol-contrib 2>&1',
-            $extracted,
-            $extractCode,
-        );
-        @unlink($tar);
-        if ($extractCode !== 0 || !is_file($binary)) {
-            throw new SiteHostInstallException('Could not unpack otelcol-contrib');
-        }
-        chmod($binary, 0755);
-        $this->atomicWrite($stamp, self::COLLECTOR_VERSION . "\n", 0644);
-    }
-
-    private function reloadSupervisor(): void
-    {
-        $output = [];
-        $code = 0;
-        exec('supervisorctl update 2>&1', $output, $code);
-        if ($code === 0) {
-            $output = [];
-            exec('supervisorctl restart talaria-otelcol 2>&1', $output, $code);
-        }
-        if ($code !== 0) {
-            $detail = preg_replace(
-                '/tal_(live|ping)_[A-Za-z0-9_-]+/',
-                '[redacted]',
-                substr(implode("\n", $output), 0, 300),
-            );
-            throw new SiteHostInstallException(
-                'supervisorctl update failed: ' . (is_string($detail) ? $detail : ''),
-            );
-        }
-    }
-
-    private static function collectorResource(string $name, string $fallback): string
-    {
-        $value = getenv($name);
-        if (!is_string($value) || trim($value) === '') {
-            return $fallback;
-        }
-
-        return trim($value);
-    }
-
-    private static function collectorAttribute(string $value, string $label): string
-    {
-        if (preg_match('/^[A-Za-z0-9_.:@+\-]{1,128}$/', $value) !== 1) {
-            throw new SiteHostInstallException($label . ' cannot be written into the collector config');
-        }
-
-        return $value;
-    }
-
-    private static function supervisordPath(string $path, string $label): string
-    {
-        $path = rtrim($path, '/');
-        if ($path === '' || preg_match('/[\s\'"\r\n]/', $path) === 1) {
-            throw new SiteHostInstallException($label . ' cannot be written into supervisord');
-        }
-
-        return $path;
     }
 
     private function atomicWrite(string $path, string $body, int $mode): void
